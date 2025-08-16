@@ -13,12 +13,22 @@
 (define-constant ERR_INVALID_LICENSE_TERMS (err u111))
 (define-constant ERR_UNAUTHORIZED_LICENSEE (err u112))
 (define-constant ERR_ROYALTY_OVERDUE (err u113))
+(define-constant ERR_OPPOSITION_EXISTS (err u114))
+(define-constant ERR_OPPOSITION_NOT_FOUND (err u115))
+(define-constant ERR_OPPOSITION_EXPIRED (err u116))
+(define-constant ERR_OPPOSITION_RESOLVED (err u117))
+(define-constant ERR_INVALID_OPPOSITION_GROUNDS (err u118))
+(define-constant ERR_SELF_OPPOSITION (err u119))
+(define-constant ERR_OPPOSITION_PERIOD_ENDED (err u120))
+(define-constant ERR_INSUFFICIENT_EVIDENCE (err u121))
 
 (define-data-var registration-fee uint u1000000)
 (define-data-var renewal-fee uint u500000)
 (define-data-var claim-duration uint u52560)
 (define-data-var max-license-duration uint u262800)
 (define-data-var min-royalty-rate uint u100)
+(define-data-var opposition-period uint u4320)
+(define-data-var opposition-fee uint u250000)
 
 (define-map trademarks
   { name: (string-ascii 50) }
@@ -82,6 +92,44 @@
     violations: uint,
     last-payment: uint,
     next-payment-due: uint
+  }
+)
+
+(define-map trademark-oppositions
+  { trademark: (string-ascii 50), opposer: principal }
+  {
+    filed-at: uint,
+    expires-at: uint,
+    grounds: (string-ascii 100),
+    evidence: (string-ascii 300),
+    status: (string-ascii 20),
+    resolution: (string-ascii 200),
+    resolved-at: uint,
+    resolver: principal,
+    appeal-deadline: uint,
+    opposition-fee-paid: uint
+  }
+)
+
+(define-map opposition-responses
+  { trademark: (string-ascii 50), opposer: principal }
+  {
+    response-submitted: bool,
+    response-text: (string-ascii 300),
+    counter-evidence: (string-ascii 300),
+    submitted-at: uint,
+    trademark-owner: principal
+  }
+)
+
+(define-map opposition-appeals
+  { trademark: (string-ascii 50), appellant: principal }
+  {
+    appeal-filed-at: uint,
+    appeal-grounds: (string-ascii 200),
+    appeal-fee-paid: uint,
+    final-decision: (string-ascii 200),
+    decided-at: uint
   }
 )
 
@@ -412,6 +460,181 @@
   )
 )
 
+(define-public (file-opposition (trademark (string-ascii 50)) (grounds (string-ascii 100)) (evidence (string-ascii 300)))
+  (let (
+    (trademark-data (unwrap! (map-get? trademarks { name: trademark }) ERR_TRADEMARK_NOT_FOUND))
+    (current-block stacks-block-height)
+    (opposition-window (var-get opposition-period))
+    (fee (var-get opposition-fee))
+    (opposition-key { trademark: trademark, opposer: tx-sender })
+    (opposition-deadline (+ (get registered-at trademark-data) opposition-window))
+  )
+    (asserts! (not (is-eq (get owner trademark-data) tx-sender)) ERR_SELF_OPPOSITION)
+    (asserts! (get active trademark-data) ERR_TRADEMARK_NOT_FOUND)
+    (asserts! (< current-block opposition-deadline) ERR_OPPOSITION_PERIOD_ENDED)
+    (asserts! (is-none (map-get? trademark-oppositions opposition-key)) ERR_OPPOSITION_EXISTS)
+    (asserts! (> (len grounds) u0) ERR_INVALID_OPPOSITION_GROUNDS)
+    (asserts! (> (len evidence) u0) ERR_INSUFFICIENT_EVIDENCE)
+    
+    (try! (stx-transfer? fee tx-sender CONTRACT_OWNER))
+    
+    (map-set trademark-oppositions
+      opposition-key
+      {
+        filed-at: current-block,
+        expires-at: (+ current-block u2160),
+        grounds: grounds,
+        evidence: evidence,
+        status: "pending",
+        resolution: "",
+        resolved-at: u0,
+        resolver: CONTRACT_OWNER,
+        appeal-deadline: u0,
+        opposition-fee-paid: fee
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (respond-to-opposition (trademark (string-ascii 50)) (opposer principal) (response-text (string-ascii 300)) (counter-evidence (string-ascii 300)))
+  (let (
+    (trademark-data (unwrap! (map-get? trademarks { name: trademark }) ERR_TRADEMARK_NOT_FOUND))
+    (opposition-key { trademark: trademark, opposer: opposer })
+    (opposition-data (unwrap! (map-get? trademark-oppositions opposition-key) ERR_OPPOSITION_NOT_FOUND))
+    (current-block stacks-block-height)
+    (response-key { trademark: trademark, opposer: opposer })
+  )
+    (asserts! (is-eq (get owner trademark-data) tx-sender) ERR_NOT_OWNER)
+    (asserts! (is-eq (get status opposition-data) "pending") ERR_OPPOSITION_RESOLVED)
+    (asserts! (< current-block (get expires-at opposition-data)) ERR_OPPOSITION_EXPIRED)
+    (asserts! (> (len response-text) u0) ERR_INSUFFICIENT_EVIDENCE)
+    
+    (map-set opposition-responses
+      response-key
+      {
+        response-submitted: true,
+        response-text: response-text,
+        counter-evidence: counter-evidence,
+        submitted-at: current-block,
+        trademark-owner: tx-sender
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-opposition (trademark (string-ascii 50)) (opposer principal) (decision (string-ascii 20)) (resolution-details (string-ascii 200)))
+  (let (
+    (opposition-key { trademark: trademark, opposer: opposer })
+    (opposition-data (unwrap! (map-get? trademark-oppositions opposition-key) ERR_OPPOSITION_NOT_FOUND))
+    (trademark-data (unwrap! (map-get? trademarks { name: trademark }) ERR_TRADEMARK_NOT_FOUND))
+    (current-block stacks-block-height)
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status opposition-data) "pending") ERR_OPPOSITION_RESOLVED)
+    (asserts! (or (is-eq decision "approved") (is-eq decision "rejected")) ERR_INVALID_OPPOSITION_GROUNDS)
+    
+    (map-set trademark-oppositions
+      opposition-key
+      (merge opposition-data {
+        status: decision,
+        resolution: resolution-details,
+        resolved-at: current-block,
+        resolver: tx-sender,
+        appeal-deadline: (+ current-block u1440)
+      })
+    )
+    
+    (if (is-eq decision "approved")
+      (map-set trademarks
+        { name: trademark }
+        (merge trademark-data { active: false })
+      )
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (file-appeal (trademark (string-ascii 50)) (opposer principal) (appeal-grounds (string-ascii 200)))
+  (let (
+    (opposition-key { trademark: trademark, opposer: opposer })
+    (opposition-data (unwrap! (map-get? trademark-oppositions opposition-key) ERR_OPPOSITION_NOT_FOUND))
+    (trademark-data (unwrap! (map-get? trademarks { name: trademark }) ERR_TRADEMARK_NOT_FOUND))
+    (current-block stacks-block-height)
+    (appeal-fee (var-get opposition-fee))
+    (appeal-key { trademark: trademark, appellant: tx-sender })
+  )
+    (asserts! (not (is-eq (get status opposition-data) "pending")) ERR_OPPOSITION_NOT_FOUND)
+    (asserts! (< current-block (get appeal-deadline opposition-data)) ERR_OPPOSITION_EXPIRED)
+    (asserts! (> (len appeal-grounds) u0) ERR_INSUFFICIENT_EVIDENCE)
+    (asserts! (or (is-eq (get owner trademark-data) tx-sender) (is-eq opposer tx-sender)) ERR_UNAUTHORIZED)
+    
+    (try! (stx-transfer? appeal-fee tx-sender CONTRACT_OWNER))
+    
+    (map-set opposition-appeals
+      appeal-key
+      {
+        appeal-filed-at: current-block,
+        appeal-grounds: appeal-grounds,
+        appeal-fee-paid: appeal-fee,
+        final-decision: "",
+        decided-at: u0
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-appeal (trademark (string-ascii 50)) (appellant principal) (final-decision (string-ascii 200)))
+  (let (
+    (appeal-key { trademark: trademark, appellant: appellant })
+    (appeal-data (unwrap! (map-get? opposition-appeals appeal-key) ERR_OPPOSITION_NOT_FOUND))
+    (trademark-data (unwrap! (map-get? trademarks { name: trademark }) ERR_TRADEMARK_NOT_FOUND))
+    (current-block stacks-block-height)
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get final-decision appeal-data) "") ERR_OPPOSITION_RESOLVED)
+    
+    (map-set opposition-appeals
+      appeal-key
+      (merge appeal-data {
+        final-decision: final-decision,
+        decided-at: current-block
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (withdraw-opposition (trademark (string-ascii 50)))
+  (let (
+    (opposition-key { trademark: trademark, opposer: tx-sender })
+    (opposition-data (unwrap! (map-get? trademark-oppositions opposition-key) ERR_OPPOSITION_NOT_FOUND))
+    (current-block stacks-block-height)
+  )
+    (asserts! (is-eq (get status opposition-data) "pending") ERR_OPPOSITION_RESOLVED)
+    (asserts! (< current-block (get expires-at opposition-data)) ERR_OPPOSITION_EXPIRED)
+    
+    (map-set trademark-oppositions
+      opposition-key
+      (merge opposition-data {
+        status: "withdrawn",
+        resolved-at: current-block,
+        resolver: tx-sender
+      })
+    )
+    
+    (ok true)
+  )
+)
+
 (define-read-only (get-trademark (name (string-ascii 50)))
   (map-get? trademarks { name: name })
 )
@@ -576,3 +799,83 @@
 (define-read-only (get-min-royalty-rate)
   (var-get min-royalty-rate)
 )
+
+(define-read-only (get-opposition (trademark (string-ascii 50)) (opposer principal))
+  (map-get? trademark-oppositions { trademark: trademark, opposer: opposer })
+)
+
+(define-read-only (get-opposition-response (trademark (string-ascii 50)) (opposer principal))
+  (map-get? opposition-responses { trademark: trademark, opposer: opposer })
+)
+
+(define-read-only (get-opposition-appeal (trademark (string-ascii 50)) (appellant principal))
+  (map-get? opposition-appeals { trademark: trademark, appellant: appellant })
+)
+
+(define-read-only (is-opposition-period-active (trademark (string-ascii 50)))
+  (let (
+    (trademark-data (map-get? trademarks { name: trademark }))
+    (current-block stacks-block-height)
+    (opposition-window (var-get opposition-period))
+  )
+    (match trademark-data
+      data (and 
+        (get active data)
+        (< current-block (+ (get registered-at data) opposition-window))
+      )
+      false
+    )
+  )
+)
+
+(define-read-only (get-opposition-deadline (trademark (string-ascii 50)))
+  (let (
+    (trademark-data (map-get? trademarks { name: trademark }))
+    (opposition-window (var-get opposition-period))
+  )
+    (match trademark-data
+      data (+ (get registered-at data) opposition-window)
+      u0
+    )
+  )
+)
+
+(define-read-only (can-file-opposition (trademark (string-ascii 50)) (potential-opposer principal))
+  (let (
+    (trademark-data (map-get? trademarks { name: trademark }))
+    (current-block stacks-block-height)
+    (opposition-window (var-get opposition-period))
+    (opposition-key { trademark: trademark, opposer: potential-opposer })
+  )
+    (match trademark-data
+      data (and 
+        (get active data)
+        (not (is-eq (get owner data) potential-opposer))
+        (< current-block (+ (get registered-at data) opposition-window))
+        (is-none (map-get? trademark-oppositions opposition-key))
+      )
+      false
+    )
+  )
+)
+
+(define-read-only (get-opposition-status (trademark (string-ascii 50)) (opposer principal))
+  (let (
+    (opposition-data (map-get? trademark-oppositions { trademark: trademark, opposer: opposer }))
+  )
+    (match opposition-data
+      data (get status data)
+      "not-found"
+    )
+  )
+)
+
+(define-read-only (get-opposition-period)
+  (var-get opposition-period)
+)
+
+(define-read-only (get-opposition-fee)
+  (var-get opposition-fee)
+)
+
+
